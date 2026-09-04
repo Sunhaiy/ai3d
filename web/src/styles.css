@@ -177,6 +177,7 @@ button, input { font: inherit; }
 .dataset-location span { margin-bottom: 3px; font-size: 9px; }
 .dataset-location code { overflow-wrap: anywhere; color: var(--copy); font-size: 10px; line-height: 1.45; }
 .training-parameters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.training-duration-field { grid-column: 1 / -1; }
 .training-output-name {
   display: flex;
   min-width: 0;

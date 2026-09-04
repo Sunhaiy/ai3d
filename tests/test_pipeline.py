@@ -11,7 +11,11 @@ import trimesh
 
 from tiny3d.data import generate_dataset, save_dataset, VoxelDataset
 from tiny3d.image_data import ImageVoxelDataset, render_voxel_projection, save_image_voxel_dataset
-from tiny3d.image_model import ImageToVoxelNet
+from tiny3d.image_model import (
+    ImageToVoxelNet,
+    ScalableImageToVoxelNet,
+    create_image_to_voxel_model,
+)
 from tiny3d.mesh import binarize_voxels, field_to_obj, voxels_to_obj
 from tiny3d.mesh_data import find_meshes, load_mesh, mesh_to_voxels
 from tiny3d.model import VoxelVAE, vae_loss, voxel_reconstruction_loss
@@ -114,6 +118,47 @@ def test_image_to_voxel_pipeline(tmp_path):
     assert set(metrics) == {"loss", "bce", "dice"}
 
 
+def test_scalable_image_to_voxel_model_forward_and_backward():
+    model = ScalableImageToVoxelNet(
+        image_size=32,
+        resolution=32,
+        latent_dim=16,
+        gradient_checkpointing=True,
+    )
+    images = torch.randn(1, 3, 32, 32)
+    logits = model(images)
+    logits.mean().backward()
+    assert logits.shape == (1, 1, 32, 32, 32)
+    assert model.image_encoder[0].weight.grad is not None
+
+
+def test_model_factory_keeps_256_parameter_count_bounded():
+    legacy = create_image_to_voxel_model(
+        image_size=64,
+        resolution=32,
+        latent_dim=256,
+    )
+    scalable = create_image_to_voxel_model(
+        image_size=128,
+        resolution=256,
+        latent_dim=256,
+    )
+    assert legacy.architecture == "legacy"
+    assert scalable.architecture == "scalable"
+    assert sum(parameter.numel() for parameter in scalable.parameters()) < 10_000_000
+
+
+def test_legacy_checkpoint_metadata_defaults_to_legacy_architecture():
+    checkpoint = {"image_size": 64, "resolution": 16, "latent_dim": 16}
+    model = create_image_to_voxel_model(
+        image_size=checkpoint["image_size"],
+        resolution=checkpoint["resolution"],
+        latent_dim=checkpoint["latent_dim"],
+        architecture=str(checkpoint.get("architecture", "legacy")),
+    )
+    assert isinstance(model, ImageToVoxelNet)
+
+
 def test_initial_checkpoint_can_transfer_compatible_layers(tmp_path):
     source_model = ImageToVoxelNet(image_size=32, resolution=8, latent_dim=4)
     with torch.no_grad():
@@ -132,6 +177,22 @@ def test_initial_checkpoint_can_transfer_compatible_layers(tmp_path):
     loaded, total = load_initial_checkpoint(source_path, target_model)
     assert 0 < loaded < total
     assert torch.all(target_model.image_encoder[0].weight == 0.25)
+
+
+def test_initial_checkpoint_transfers_encoder_between_architectures(tmp_path):
+    source_model = ImageToVoxelNet(image_size=32, resolution=16, latent_dim=16)
+    with torch.no_grad():
+        source_model.image_encoder[0].weight.fill_(0.125)
+    source_path = tmp_path / "legacy.pt"
+    torch.save({"model_state": source_model.state_dict()}, source_path)
+    target_model = ScalableImageToVoxelNet(
+        image_size=32,
+        resolution=32,
+        latent_dim=16,
+    )
+    loaded, total = load_initial_checkpoint(source_path, target_model)
+    assert 0 < loaded < total
+    assert torch.all(target_model.image_encoder[0].weight == 0.125)
 
 
 def test_compact_dataset_reuses_voxel_targets(tmp_path):
@@ -337,7 +398,34 @@ def test_training_manager_restores_paused_state_after_restart(tmp_path):
     assert status["current_epoch"] == 3
     assert status["current_batch"] == 7
     assert status["config"]["resolution"] == 128
+    assert status["config"]["architecture"] == "legacy"
+    assert status["config"]["max_hours"] == 0.0
     assert status["output_checkpoint"] == "named_run.pt"
+
+
+def test_training_manager_configures_256_long_run(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    np.savez(
+        data_dir / "image3d_pairs.npz",
+        resolution=np.asarray(256),
+        image_size=np.asarray(128),
+        target_count=np.asarray(2),
+    )
+    manager = TrainingManager(tmp_path, tmp_path / "modeldata")
+    captured: dict[str, object] = {}
+
+    def capture_launch(kind, command, **changes):
+        captured.update({"kind": kind, "command": command, "changes": changes})
+
+    monkeypatch.setattr(manager, "_launch", capture_launch)
+    manager.start_named_training(1000, 1, "long_run", None, 72.0)
+
+    command = captured["command"]
+    changes = captured["changes"]
+    assert command[command.index("--max-hours") + 1] == "72.0"
+    assert changes["config"]["architecture"] == "scalable"
+    assert changes["config"]["max_hours"] == 72.0
 
 
 def test_training_run_names_are_safe_and_do_not_overwrite(tmp_path):

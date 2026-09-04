@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from tiny3d.image_data import load_square_image
-from tiny3d.image_model import ImageToVoxelNet
+from tiny3d.image_model import create_image_to_voxel_model
 from tiny3d.mesh import binarize_voxels, field_to_obj
 
 
@@ -35,10 +35,11 @@ def main() -> None:
         raise ValueError("threshold must be between 0 and 1")
     device = choose_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model = ImageToVoxelNet(
+    model = create_image_to_voxel_model(
         image_size=int(checkpoint["image_size"]),
         resolution=int(checkpoint["resolution"]),
         latent_dim=int(checkpoint["latent_dim"]),
+        architecture=str(checkpoint.get("architecture", "legacy")),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()

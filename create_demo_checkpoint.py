@@ -18,6 +18,7 @@ def main() -> None:
             "image_size": model.image_size,
             "resolution": model.resolution,
             "latent_dim": model.latent_dim,
+            "architecture": model.architecture,
             "epochs": 0,
             "validation_loss": float("nan"),
         },

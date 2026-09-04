@@ -7,6 +7,7 @@ export type Checkpoint = {
   image_size?: number;
   resolution?: number;
   latent_dim?: number;
+  architecture?: string;
   target_epochs?: number;
   validation_loss?: number;
   initial_checkpoint?: string | null;
@@ -85,6 +86,8 @@ export type TrainingStatus = {
     image_size: number;
     run_name: string;
     initial_checkpoint: string | null;
+    max_hours: number;
+    architecture: string;
   };
   current_epoch: number;
   total_epochs: number;

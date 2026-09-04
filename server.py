@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tiny3d.image_data import load_square_image
-from tiny3d.image_model import ImageToVoxelNet
+from tiny3d.image_model import ImageToVoxelModel, create_image_to_voxel_model
 from tiny3d.mesh import binarize_voxels, field_to_obj
 from training_manager import TrainingManager
 
@@ -35,7 +35,7 @@ app = FastAPI(title="Tiny Image-to-3D Studio", version="1.0.0")
 jobs: dict[str, dict[str, Any]] = {}
 jobs_lock = threading.Lock()
 inference_lock = threading.Lock()
-model_cache: dict[str, tuple[float, ImageToVoxelNet, torch.device]] = {}
+model_cache: dict[str, tuple[float, ImageToVoxelModel, torch.device]] = {}
 training_manager = TrainingManager(
     ROOT,
     Path(os.environ.get("AI3D_DATA_ROOT", r"E:\modeldata")),
@@ -51,6 +51,7 @@ class PrepareTrainingRequest(BaseModel):
 class StartTrainingRequest(BaseModel):
     epochs: int = 100
     batch_size: int = 32
+    max_hours: float = 0.0
     name: str | None = None
     initial_checkpoint: str | None = None
 
@@ -97,6 +98,7 @@ def checkpoint_metadata(path: Path) -> dict[str, Any]:
                 "image_size": int(checkpoint["image_size"]),
                 "resolution": int(checkpoint["resolution"]),
                 "latent_dim": int(checkpoint["latent_dim"]),
+                "architecture": str(checkpoint.get("architecture", "legacy")),
                 "target_epochs": int(checkpoint.get("target_epochs", checkpoint.get("epochs", 0))),
                 "validation_loss": float(checkpoint.get("validation_loss", 0.0)),
                 "initial_checkpoint": checkpoint.get("initial_checkpoint"),
@@ -107,7 +109,7 @@ def checkpoint_metadata(path: Path) -> dict[str, Any]:
     return result
 
 
-def load_model(path: Path) -> tuple[ImageToVoxelNet, torch.device]:
+def load_model(path: Path) -> tuple[ImageToVoxelModel, torch.device]:
     cache_key = str(path)
     modified = path.stat().st_mtime
     cached = model_cache.get(cache_key)
@@ -116,10 +118,11 @@ def load_model(path: Path) -> tuple[ImageToVoxelNet, torch.device]:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    model = ImageToVoxelNet(
+    model = create_image_to_voxel_model(
         image_size=int(checkpoint["image_size"]),
         resolution=int(checkpoint["resolution"]),
         latent_dim=int(checkpoint["latent_dim"]),
+        architecture=str(checkpoint.get("architecture", "legacy")),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -239,6 +242,7 @@ def start_training(request: StartTrainingRequest) -> dict[str, Any]:
             request.batch_size,
             request.name,
             request.initial_checkpoint,
+            request.max_hours,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

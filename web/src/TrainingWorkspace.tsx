@@ -32,10 +32,11 @@ import type { Checkpoint, TrainingHistoryPoint, TrainingStatus } from "./types";
 
 const ACTIVE_STATUSES = new Set(["preparing", "training", "pausing", "stopping"]);
 const RESOLUTION_OPTIONS = [
-  { id: "16", label: "16³ · 快速", batchSize: 32 },
-  { id: "32", label: "32³ · 推荐", batchSize: 32 },
-  { id: "64", label: "64³ · 精细", batchSize: 16 },
-  { id: "128", label: "128³ · 实验", batchSize: 4 },
+  { id: "16", label: "16³ · 快速", batchSize: 32, epochs: 100, maxHours: 0 },
+  { id: "32", label: "32³ · 推荐", batchSize: 32, epochs: 100, maxHours: 0 },
+  { id: "64", label: "64³ · 精细", batchSize: 16, epochs: 100, maxHours: 0 },
+  { id: "128", label: "128³ · 实验", batchSize: 4, epochs: 100, maxHours: 0 },
+  { id: "256", label: "256³ · 长时训练", batchSize: 1, epochs: 1000, maxHours: 72 },
 ];
 const SCRATCH_MODEL = "__scratch__";
 
@@ -133,6 +134,7 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
   const [dataRoot, setDataRoot] = useState("E:\\modeldata");
   const [epochs, setEpochs] = useState(100);
   const [batchSize, setBatchSize] = useState(32);
+  const [maxHours, setMaxHours] = useState(0);
   const [resolution, setResolution] = useState(32);
   const [runName, setRunName] = useState("");
   const [initialCheckpoint, setInitialCheckpoint] = useState(SCRATCH_MODEL);
@@ -160,6 +162,9 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
         setBatchSize(useDatasetResolution
           ? resolutionOption?.batchSize ?? next.config.batch_size
           : next.config.batch_size);
+        setMaxHours(useDatasetResolution
+          ? resolutionOption?.maxHours ?? next.config.max_hours ?? 0
+          : next.config.max_hours ?? 0);
         setResolution(initialResolution);
         setRunName(next.config.run_name ?? "");
         setInitialCheckpoint(next.config.initial_checkpoint ?? SCRATCH_MODEL);
@@ -215,6 +220,7 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
   const initialCheckpointMatches = initialCheckpoint === SCRATCH_MODEL || Boolean(
     selectedInitialCheckpoint,
   );
+  const targetArchitecture = resolution >= 256 ? "scalable" : "legacy";
   const lossValues = (status?.history ?? [])
     .filter((point): point is TrainingHistoryPoint & { validation_loss: number } => point.validation_loss !== null)
     .map((point) => ({ epoch: point.epoch, value: point.validation_loss }));
@@ -265,7 +271,11 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
               const next = Number(value);
               const option = RESOLUTION_OPTIONS.find((item) => Number(item.id) === next);
               setResolution(next);
-              if (option) setBatchSize(option.batchSize);
+              if (option) {
+                setBatchSize(option.batchSize);
+                setEpochs(option.epochs);
+                setMaxHours(option.maxHours);
+              }
             }}
           >
             <Label>体素分辨率</Label>
@@ -359,6 +369,7 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
                           checkpoint.image_size === 128
                           && checkpoint.resolution === resolution
                           && checkpoint.latent_dim === (resolution <= 16 ? 128 : 256)
+                          && (checkpoint.architecture ?? "legacy") === targetArchitecture
                             ? "完整权重"
                             : "迁移兼容层"
                         }
@@ -412,6 +423,23 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
                 <NumberField.IncrementButton />
               </NumberField.Group>
             </NumberField>
+            <NumberField
+              className="training-duration-field"
+              value={maxHours}
+              minValue={0}
+              maxValue={720}
+              step={1}
+              variant="secondary"
+              isDisabled={active || canResume}
+              onChange={(value) => setMaxHours(value ?? 0)}
+            >
+              <Label>最长训练时长（小时，0 不限）</Label>
+              <NumberField.Group>
+                <NumberField.DecrementButton />
+                <NumberField.Input />
+                <NumberField.IncrementButton />
+              </NumberField.Group>
+            </NumberField>
           </div>
           <Button
             fullWidth
@@ -423,6 +451,7 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
               : void runAction("train", "/api/training/start", {
                   epochs,
                   batch_size: batchSize,
+                  max_hours: maxHours,
                   name: runName.trim() || null,
                   initial_checkpoint: initialCheckpoint === SCRATCH_MODEL ? null : initialCheckpoint,
                 })}

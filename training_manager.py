@@ -161,6 +161,8 @@ class TrainingManager:
                 "image_size": int(resume_state["image_size"]),
                 "run_name": str(resume_state.get("run_name", "")),
                 "initial_checkpoint": resume_state.get("initial_checkpoint"),
+                "max_hours": float(resume_state.get("max_hours", 0.0)),
+                "architecture": str(resume_state.get("architecture", "legacy")),
             }
             if resume_state
             else {
@@ -170,6 +172,8 @@ class TrainingManager:
                 "image_size": 128,
                 "run_name": "",
                 "initial_checkpoint": None,
+                "max_hours": 0.0,
+                "architecture": "legacy",
             }
         )
         self._state: dict[str, Any] = {
@@ -206,7 +210,11 @@ class TrainingManager:
             "pid": None,
             "started_at": None,
             "updated_at": now_iso(),
-            "elapsed_seconds": 0,
+            "elapsed_seconds": (
+                float(resume_state.get("elapsed_training_seconds", 0.0))
+                if resume_state
+                else 0.0
+            ),
             "error": None,
             "stop_requested": False,
             "pause_requested": False,
@@ -310,8 +318,8 @@ class TrainingManager:
         resolution: int,
         image_size: int,
     ) -> dict[str, Any]:
-        if resolution not in {16, 32, 64, 128}:
-            raise ValueError("体素分辨率仅支持 16、32、64 或 128")
+        if resolution not in {16, 32, 64, 128, 256}:
+            raise ValueError("体素分辨率仅支持 16、32、64、128 或 256")
         if image_size not in {64, 128, 256}:
             raise ValueError("图片尺寸仅支持 64、128 或 256")
         summary = inspect_data_root(data_root)
@@ -361,15 +369,17 @@ class TrainingManager:
                 "target_count": summary["matched_mesh_count"],
             },
             config={
-                "epochs": 100,
-                "batch_size": 32,
+                "epochs": 1000 if resolution == 256 else 100,
+                "batch_size": 1 if resolution == 256 else 32,
                 "resolution": resolution,
                 "image_size": image_size,
                 "run_name": "",
                 "initial_checkpoint": None,
+                "max_hours": 72.0 if resolution == 256 else 0.0,
+                "architecture": "scalable" if resolution == 256 else "legacy",
             },
             current_epoch=0,
-            total_epochs=100,
+            total_epochs=1000 if resolution == 256 else 100,
             current_batch=0,
             total_batches=0,
             metrics={"train_loss": None, "validation_loss": None, "iou": None},
@@ -379,7 +389,7 @@ class TrainingManager:
         return self.status()
 
     def start_training(self, epochs: int, batch_size: int) -> dict[str, Any]:
-        return self.start_named_training(epochs, batch_size, None, None)
+        return self.start_named_training(epochs, batch_size, None, None, 0.0)
 
     def start_named_training(
         self,
@@ -387,11 +397,14 @@ class TrainingManager:
         batch_size: int,
         run_name: str | None,
         initial_checkpoint: str | None,
+        max_hours: float = 0.0,
     ) -> dict[str, Any]:
         if not 1 <= epochs <= 1000:
             raise ValueError("训练轮数必须在 1 到 1000 之间")
         if not 1 <= batch_size <= 128:
             raise ValueError("批大小必须在 1 到 128 之间")
+        if not 0.0 <= max_hours <= 720.0:
+            raise ValueError("最长训练时长必须在 0 到 720 小时之间")
         if not self.dataset_path.is_file():
             raise ValueError("训练数据集尚未制作完成")
         with self._lock:
@@ -406,6 +419,7 @@ class TrainingManager:
             else None
         )
         latent_dim = 128 if resolution <= 16 else 256
+        architecture = "scalable" if resolution >= 256 else "legacy"
         output_path = self._allocate_checkpoint_path(run_name)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         self._clear_resume_files()
@@ -431,6 +445,8 @@ class TrainingManager:
             str(self.pause_request_path),
             "--resume-checkpoint",
             str(self.resume_checkpoint_path),
+            "--max-hours",
+            str(max_hours),
         ]
         if initial_path is not None:
             command.extend(["--init-checkpoint", str(initial_path)])
@@ -446,6 +462,8 @@ class TrainingManager:
                 "image_size": image_size,
                 "run_name": output_path.stem,
                 "initial_checkpoint": initial_path.name if initial_path else None,
+                "max_hours": max_hours,
+                "architecture": architecture,
             },
             current_epoch=0,
             total_epochs=epochs,
@@ -480,6 +498,8 @@ class TrainingManager:
         epochs = int(resume_state["target_epochs"])
         batch_size = int(resume_state["batch_size"])
         latent_dim = int(resume_state["latent_dim"])
+        max_hours = float(resume_state.get("max_hours", 0.0))
+        architecture = str(resume_state.get("architecture", "legacy"))
         output_path = self._checkpoint_output_path(str(resume_state["output_checkpoint"]))
         self.pause_request_path.unlink(missing_ok=True)
         command = [
@@ -506,6 +526,8 @@ class TrainingManager:
             str(self.resume_checkpoint_path),
             "--resume",
             str(self.resume_checkpoint_path),
+            "--max-hours",
+            str(max_hours),
         ]
         self._launch(
             "train",
@@ -520,6 +542,8 @@ class TrainingManager:
                 "image_size": int(resume_state["image_size"]),
                 "run_name": str(resume_state.get("run_name", output_path.stem)),
                 "initial_checkpoint": resume_state.get("initial_checkpoint"),
+                "max_hours": max_hours,
+                "architecture": architecture,
             },
             current_epoch=int(resume_state["epoch"]),
             total_epochs=epochs,
@@ -528,7 +552,9 @@ class TrainingManager:
             metrics=metrics,
             history=history,
             logs=logs,
-            elapsed_seconds=elapsed_seconds,
+            elapsed_seconds=float(
+                resume_state.get("elapsed_training_seconds", elapsed_seconds)
+            ),
             can_resume=False,
             output_checkpoint=output_path.name,
         )

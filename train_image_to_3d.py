@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from tiny3d.image_data import ImageVoxelDataset
-from tiny3d.image_model import ImageToVoxelNet
+from tiny3d.image_model import ImageToVoxelModel, create_image_to_voxel_model
 from tiny3d.model import voxel_reconstruction_loss
 
 
@@ -37,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--init-checkpoint", default=None)
+    parser.add_argument(
+        "--max-hours",
+        type=float,
+        default=0.0,
+        help="Stop successfully after this many cumulative training hours; 0 disables the limit.",
+    )
     return parser.parse_args()
 
 
@@ -84,7 +91,7 @@ def split_by_mesh(
 
 
 def evaluate(
-    model: ImageToVoxelNet,
+    model: ImageToVoxelModel,
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[float, str, dict[str, float]]:
@@ -117,12 +124,14 @@ def atomic_torch_save(payload: dict[str, Any], destination: Path) -> None:
 
 def save_checkpoint(
     destination: Path,
-    model: ImageToVoxelNet,
+    model: ImageToVoxelModel,
     epoch: int,
     validation_loss: float,
     *,
     target_epochs: int,
     initial_checkpoint: str | None,
+    max_hours: float,
+    elapsed_training_seconds: float,
 ) -> None:
     atomic_torch_save(
         {
@@ -130,10 +139,13 @@ def save_checkpoint(
             "image_size": model.image_size,
             "resolution": model.resolution,
             "latent_dim": model.latent_dim,
+            "architecture": model.architecture,
             "epochs": epoch,
             "target_epochs": target_epochs,
             "validation_loss": validation_loss,
             "initial_checkpoint": initial_checkpoint,
+            "max_hours": max_hours,
+            "elapsed_training_seconds": elapsed_training_seconds,
         },
         destination,
     )
@@ -145,7 +157,7 @@ def resume_metadata_path(checkpoint: Path) -> Path:
 
 def save_resume_checkpoint(
     destination: Path,
-    model: ImageToVoxelNet,
+    model: ImageToVoxelModel,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     *,
@@ -159,6 +171,8 @@ def save_resume_checkpoint(
     history: list[dict[str, float | int | None]],
     output_checkpoint: str,
     initial_checkpoint: str | None,
+    max_hours: float,
+    elapsed_training_seconds: float,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     atomic_torch_save(
@@ -170,6 +184,7 @@ def save_resume_checkpoint(
             "image_size": model.image_size,
             "resolution": model.resolution,
             "latent_dim": model.latent_dim,
+            "architecture": model.architecture,
             "epoch": epoch,
             "completed_batches": completed_batches,
             "epoch_totals": epoch_totals,
@@ -180,6 +195,8 @@ def save_resume_checkpoint(
             "output_checkpoint": output_checkpoint,
             "run_name": Path(output_checkpoint).stem,
             "initial_checkpoint": initial_checkpoint,
+            "max_hours": max_hours,
+            "elapsed_training_seconds": elapsed_training_seconds,
         },
         destination,
     )
@@ -191,6 +208,7 @@ def save_resume_checkpoint(
         "image_size": model.image_size,
         "resolution": model.resolution,
         "latent_dim": model.latent_dim,
+        "architecture": model.architecture,
         "epoch": epoch,
         "completed_batches": completed_batches,
         "total_batches": total_batches,
@@ -199,6 +217,8 @@ def save_resume_checkpoint(
         "output_checkpoint": output_checkpoint,
         "run_name": Path(output_checkpoint).stem,
         "initial_checkpoint": initial_checkpoint,
+        "max_hours": max_hours,
+        "elapsed_training_seconds": elapsed_training_seconds,
         "progress": round(
             ((epoch - 1) + completed_batches / max(total_batches, 1))
             / target_epochs
@@ -220,13 +240,14 @@ def save_resume_checkpoint(
 
 def load_resume_checkpoint(
     source: Path,
-    model: ImageToVoxelNet,
+    model: ImageToVoxelModel,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     *,
     target_epochs: int,
     batch_size: int,
     output_checkpoint: str,
+    max_hours: float,
 ) -> dict[str, Any]:
     checkpoint = torch.load(source, map_location="cpu", weights_only=True)
     expected = {
@@ -241,6 +262,17 @@ def load_resume_checkpoint(
             raise ValueError(
                 f"resume checkpoint {key}={checkpoint.get(key)!r} does not match {value}"
             )
+    checkpoint_architecture = str(checkpoint.get("architecture", "legacy"))
+    if checkpoint_architecture != model.architecture:
+        raise ValueError(
+            "resume checkpoint architecture="
+            f"{checkpoint_architecture!r} does not match {model.architecture!r}"
+        )
+    checkpoint_max_hours = float(checkpoint.get("max_hours", 0.0))
+    if checkpoint_max_hours != max_hours:
+        raise ValueError(
+            f"resume checkpoint max_hours={checkpoint_max_hours!r} does not match {max_hours!r}"
+        )
     if checkpoint.get("output_checkpoint") != output_checkpoint:
         raise ValueError("resume checkpoint output file does not match this training run")
     model.load_state_dict(checkpoint["model_state"])
@@ -249,7 +281,7 @@ def load_resume_checkpoint(
     return checkpoint
 
 
-def load_initial_checkpoint(source: Path, model: ImageToVoxelNet) -> tuple[int, int]:
+def load_initial_checkpoint(source: Path, model: ImageToVoxelModel) -> tuple[int, int]:
     checkpoint = torch.load(source, map_location="cpu", weights_only=True)
     source_state = checkpoint["model_state"]
     target_state = model.state_dict()
@@ -283,6 +315,8 @@ def main() -> None:
         raise ValueError("validation-split must be in [0, 1)")
     if args.log_every < 0:
         raise ValueError("log-every cannot be negative")
+    if not 0.0 <= args.max_hours <= 720.0:
+        raise ValueError("max-hours must be between 0 and 720")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -311,10 +345,11 @@ def main() -> None:
     )
     image_size = dataset.images.shape[-1]
     resolution = dataset.voxels.shape[-1]
-    model = ImageToVoxelNet(
+    model = create_image_to_voxel_model(
         image_size=image_size,
         resolution=resolution,
         latent_dim=args.latent_dim,
+        gradient_checkpointing=resolution >= 256,
     ).to(device)
     if args.resume and args.init_checkpoint:
         raise ValueError("--resume and --init-checkpoint cannot be used together")
@@ -352,6 +387,7 @@ def main() -> None:
     resume_batches = 0
     resume_totals = {key: 0.0 for key in ("loss", "bce", "dice")}
     history: list[dict[str, float | int | None]] = []
+    elapsed_before_launch = 0.0
     if args.resume:
         resume_source = Path(args.resume)
         if not resume_source.is_file():
@@ -364,6 +400,7 @@ def main() -> None:
             target_epochs=args.epochs,
             batch_size=args.batch_size,
             output_checkpoint=destination.name,
+            max_hours=args.max_hours,
         )
         start_epoch = int(resume_state["epoch"])
         resume_batches = int(resume_state["completed_batches"])
@@ -374,16 +411,26 @@ def main() -> None:
         best_loss = float(resume_state["best_loss"])
         history = list(resume_state.get("history", []))
         initial_checkpoint_name = resume_state.get("initial_checkpoint")
+        elapsed_before_launch = float(
+            resume_state.get("elapsed_training_seconds", 0.0)
+        )
         print(
             f"Resuming epoch {start_epoch:03d}/{args.epochs} after "
             f"batch {resume_batches:03d}",
             flush=True,
         )
 
+    training_started = time.monotonic()
+
+    def elapsed_training_seconds() -> float:
+        return elapsed_before_launch + time.monotonic() - training_started
+
     print(
         f"Device: {device}; train: {training_count}; validation: {validation_count}; "
-        f"image: {image_size}^2; voxels: {resolution}^3"
+        f"image: {image_size}^2; voxels: {resolution}^3; "
+        f"architecture: {model.architecture}; max hours: {args.max_hours:g}"
     )
+    reached_time_limit = False
     for epoch in range(start_epoch, args.epochs + 1):
         training_loader = training_loader_for_epoch(
             training_set,
@@ -442,6 +489,8 @@ def main() -> None:
                     history=history,
                     output_checkpoint=destination.name,
                     initial_checkpoint=initial_checkpoint_name,
+                    max_hours=args.max_hours,
+                    elapsed_training_seconds=elapsed_training_seconds(),
                 )
                 pause_file.unlink(missing_ok=True)
                 print(
@@ -486,7 +535,19 @@ def main() -> None:
                 validation_loss,
                 target_epochs=args.epochs,
                 initial_checkpoint=initial_checkpoint_name,
+                max_hours=args.max_hours,
+                elapsed_training_seconds=elapsed_training_seconds(),
             )
+
+        elapsed = elapsed_training_seconds()
+        if args.max_hours > 0 and elapsed >= args.max_hours * 3600:
+            reached_time_limit = True
+            print(
+                f"Reached {args.max_hours:g}-hour training limit after epoch "
+                f"{epoch:03d}/{args.epochs}; keeping the best checkpoint",
+                flush=True,
+            )
+            break
 
         if (
             epoch < args.epochs
@@ -509,6 +570,8 @@ def main() -> None:
                 history=history,
                 output_checkpoint=destination.name,
                 initial_checkpoint=initial_checkpoint_name,
+                max_hours=args.max_hours,
+                elapsed_training_seconds=elapsed_training_seconds(),
             )
             pause_file.unlink(missing_ok=True)
             print(
@@ -526,7 +589,11 @@ def main() -> None:
         resume_metadata_path(resume_destination).unlink(missing_ok=True)
     if pause_file is not None:
         pause_file.unlink(missing_ok=True)
-    print(f"Saved best checkpoint to {destination} (loss={best_loss:.4f})")
+    reason = "time limit reached; " if reached_time_limit else ""
+    print(
+        f"Saved best checkpoint to {destination} "
+        f"({reason}loss={best_loss:.4f})"
+    )
 
 
 if __name__ == "__main__":
