@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 from tiny3d.image_data import load_square_image
-from tiny3d.image_model import create_image_to_voxel_model
+from tiny3d.image_model import ImplicitImageToVoxelNet, create_image_to_voxel_model
+from tiny3d.implicit import adaptive_implicit_to_obj
 from tiny3d.mesh import binarize_voxels, field_to_obj
 
 
@@ -47,15 +48,27 @@ def main() -> None:
     image = load_square_image(args.image, model.image_size)
     tensor = torch.from_numpy(image.astype(np.float32) / 255.0)
     tensor = tensor.permute(2, 0, 1).unsqueeze(0).to(device)
-    with torch.inference_mode():
-        probabilities = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
-    voxels = binarize_voxels(probabilities, args.threshold)
-
     output = Path(args.output)
     if output.suffix.lower() != ".obj":
         output = output.with_suffix(".obj")
+    if isinstance(model, ImplicitImageToVoxelNet):
+        vertices, triangles, probabilities, _ = adaptive_implicit_to_obj(
+            model,
+            tensor,
+            output,
+            threshold=args.threshold,
+        )
+        voxels = binarize_voxels(probabilities, args.threshold)
+    else:
+        with torch.inference_mode():
+            probabilities = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
+        voxels = binarize_voxels(probabilities, args.threshold)
+        vertices, triangles = field_to_obj(
+            probabilities,
+            output,
+            threshold=args.threshold,
+        )
     np.save(output.with_suffix(".npy"), voxels.astype(np.uint8))
-    vertices, triangles = field_to_obj(probabilities, output, threshold=args.threshold)
     print(
         f"Saved {output}: {int(voxels.sum())} voxels, "
         f"{vertices} vertices, {triangles} triangles"

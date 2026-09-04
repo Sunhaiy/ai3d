@@ -233,6 +233,8 @@ class TrainingManager:
             "resolution": 0,
             "image_size": 0,
             "target_count": 0,
+            "point_count": 0,
+            "representation": "dense_voxels",
             "preview_path": str(self.preview_dir),
         }
         if exists:
@@ -245,6 +247,14 @@ class TrainingManager:
                 )
                 result["target_count"] = int(
                     archive["target_count"] if "target_count" in archive.files else len(archive["voxels"])
+                )
+                result["point_count"] = int(
+                    archive["point_count"] if "point_count" in archive.files else 0
+                )
+                result["representation"] = str(
+                    archive["representation"]
+                    if "representation" in archive.files
+                    else "dense_voxels"
                 )
         return result
 
@@ -318,8 +328,8 @@ class TrainingManager:
         resolution: int,
         image_size: int,
     ) -> dict[str, Any]:
-        if resolution not in {16, 32, 64, 128, 256}:
-            raise ValueError("体素分辨率仅支持 16、32、64、128 或 256")
+        if resolution not in {16, 32, 64, 128, 256, 512, 1024}:
+            raise ValueError("体素分辨率仅支持 16、32、64、128、256、512 或 1024")
         if image_size not in {64, 128, 256}:
             raise ValueError("图片尺寸仅支持 64、128 或 256")
         summary = inspect_data_root(data_root)
@@ -354,6 +364,12 @@ class TrainingManager:
             "--preview-dir",
             str(self.preview_dir),
         ]
+        if resolution >= 512:
+            command.extend(["--point-count", "65536"])
+        long_run = resolution >= 256
+        architecture = (
+            "implicit" if resolution >= 512 else "scalable" if resolution == 256 else "legacy"
+        )
         self._launch(
             "prepare",
             command,
@@ -369,17 +385,17 @@ class TrainingManager:
                 "target_count": summary["matched_mesh_count"],
             },
             config={
-                "epochs": 1000 if resolution == 256 else 100,
-                "batch_size": 1 if resolution == 256 else 32,
+                "epochs": 1000 if long_run else 100,
+                "batch_size": 1 if long_run else 32,
                 "resolution": resolution,
                 "image_size": image_size,
                 "run_name": "",
                 "initial_checkpoint": None,
-                "max_hours": 72.0 if resolution == 256 else 0.0,
-                "architecture": "scalable" if resolution == 256 else "legacy",
+                "max_hours": 72.0 if long_run else 0.0,
+                "architecture": architecture,
             },
             current_epoch=0,
-            total_epochs=1000 if resolution == 256 else 100,
+            total_epochs=1000 if long_run else 100,
             current_batch=0,
             total_batches=0,
             metrics={"train_loss": None, "validation_loss": None, "iou": None},
@@ -419,7 +435,9 @@ class TrainingManager:
             else None
         )
         latent_dim = 128 if resolution <= 16 else 256
-        architecture = "scalable" if resolution >= 256 else "legacy"
+        architecture = (
+            "implicit" if resolution >= 512 else "scalable" if resolution == 256 else "legacy"
+        )
         output_path = self._allocate_checkpoint_path(run_name)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         self._clear_resume_files()

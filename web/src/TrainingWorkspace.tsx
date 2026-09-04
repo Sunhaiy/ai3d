@@ -37,6 +37,8 @@ const RESOLUTION_OPTIONS = [
   { id: "64", label: "64³ · 精细", batchSize: 16, epochs: 100, maxHours: 0 },
   { id: "128", label: "128³ · 实验", batchSize: 4, epochs: 100, maxHours: 0 },
   { id: "256", label: "256³ · 长时训练", batchSize: 1, epochs: 1000, maxHours: 72 },
+  { id: "512", label: "512³ · 隐式表面", batchSize: 1, epochs: 1000, maxHours: 72 },
+  { id: "1024", label: "1024³ · 隐式表面", batchSize: 1, epochs: 1000, maxHours: 72 },
 ];
 const SCRATCH_MODEL = "__scratch__";
 
@@ -220,7 +222,11 @@ export default function TrainingWorkspace({ checkpoints }: { checkpoints: Checkp
   const initialCheckpointMatches = initialCheckpoint === SCRATCH_MODEL || Boolean(
     selectedInitialCheckpoint,
   );
-  const targetArchitecture = resolution >= 256 ? "scalable" : "legacy";
+  const targetArchitecture = resolution >= 512
+    ? "implicit"
+    : resolution >= 256
+      ? "scalable"
+      : "legacy";
   const lossValues = (status?.history ?? [])
     .filter((point): point is TrainingHistoryPoint & { validation_loss: number } => point.validation_loss !== null)
     .map((point) => ({ epoch: point.epoch, value: point.validation_loss }));

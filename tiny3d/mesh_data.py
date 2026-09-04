@@ -52,6 +52,66 @@ def random_rotation(mode: str, rng: np.random.Generator) -> np.ndarray:
     raise ValueError(f"unknown rotation mode: {mode}")
 
 
+def normalize_mesh(
+    mesh: trimesh.Trimesh,
+    transform: np.ndarray | None = None,
+) -> trimesh.Trimesh:
+    normalized = mesh.copy()
+    if transform is not None:
+        normalized.apply_transform(transform)
+    bounds = normalized.bounds
+    center = bounds.mean(axis=0)
+    max_extent = float((bounds[1] - bounds[0]).max())
+    if not np.isfinite(max_extent) or max_extent <= 0.0:
+        raise ValueError("mesh has zero or invalid extent")
+    normalized.apply_translation(-center)
+    normalized.apply_scale(1.7 / max_extent)
+    return normalized
+
+
+def sample_implicit_occupancy(
+    mesh: trimesh.Trimesh,
+    resolution: int,
+    point_count: int,
+    *,
+    seed: int,
+    transform: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if resolution < 512 or resolution & (resolution - 1):
+        raise ValueError("implicit resolution must be a power of two of at least 512")
+    if point_count < 4096:
+        raise ValueError("point_count must be at least 4096")
+
+    normalized = normalize_mesh(mesh, transform)
+    if not normalized.is_watertight:
+        raise ValueError("implicit occupancy sampling requires a watertight mesh")
+    rng = np.random.default_rng(seed)
+    uniform_count = point_count // 2
+    surface_count = point_count - uniform_count
+    uniform = rng.uniform(-1.0, 1.0, size=(uniform_count, 3))
+    surface, face_indices = trimesh.sample.sample_surface(
+        normalized,
+        surface_count,
+        seed=rng,
+    )
+    normal_offsets = rng.normal(
+        0.0,
+        4.0 / resolution,
+        size=(surface_count, 1),
+    )
+    near_surface = surface + normalized.face_normals[face_indices] * normal_offsets
+    points = np.concatenate((uniform, near_surface), axis=0)
+    points = np.clip(points, -1.0, 1.0)
+    grid_indices = np.rint((points + 1.0) * 0.5 * (resolution - 1))
+    points = grid_indices / (resolution - 1) * 2.0 - 1.0
+    occupancies = normalized.contains(points)
+    if not occupancies.any() or occupancies.all():
+        raise ValueError(
+            "implicit occupancy sampling needs a closed mesh with inside and outside points"
+        )
+    return points.astype(np.float16), occupancies.astype(np.uint8)
+
+
 def mesh_to_voxels(
     mesh: trimesh.Trimesh,
     resolution: int,
@@ -62,17 +122,7 @@ def mesh_to_voxels(
     if resolution < 8 or resolution % 8 != 0:
         raise ValueError("resolution must be at least 8 and divisible by 8")
 
-    normalized = mesh.copy()
-    if transform is not None:
-        normalized.apply_transform(transform)
-    bounds = normalized.bounds
-    center = bounds.mean(axis=0)
-    max_extent = float((bounds[1] - bounds[0]).max())
-    if not np.isfinite(max_extent) or max_extent <= 0.0:
-        raise ValueError("mesh has zero or invalid extent")
-
-    normalized.apply_translation(-center)
-    normalized.apply_scale(1.7 / max_extent)
+    normalized = normalize_mesh(mesh, transform)
     pitch = 2.0 / resolution
     voxel_grid = normalized.voxelized(pitch=pitch)
     if fill:

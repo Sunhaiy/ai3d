@@ -11,8 +11,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from tiny3d.image_data import ImageVoxelDataset
-from tiny3d.image_model import ImageToVoxelModel, create_image_to_voxel_model
+from tiny3d.image_data import ImageVoxelDataset, ImplicitImagePointDataset
+from tiny3d.image_model import (
+    ImageToVoxelModel,
+    ImplicitImageToVoxelNet,
+    create_image_to_voxel_model,
+)
 from tiny3d.model import voxel_reconstruction_loss
 
 
@@ -59,8 +63,11 @@ def average_metrics(totals: dict[str, float], batches: int) -> str:
     return " ".join(f"{key}={value / batches:.4f}" for key, value in totals.items())
 
 
+TrainingDataset = ImageVoxelDataset | ImplicitImagePointDataset
+
+
 def split_by_mesh(
-    dataset: ImageVoxelDataset,
+    dataset: TrainingDataset,
     validation_split: float,
     seed: int,
 ) -> tuple[Subset, Subset]:
@@ -98,16 +105,26 @@ def evaluate(
     model.eval()
     totals = {key: 0.0 for key in ("loss", "bce", "dice", "iou")}
     with torch.inference_mode():
-        for images, voxels in loader:
-            images = images.to(device, non_blocking=True)
-            voxels = voxels.to(device, non_blocking=True)
+        for batch in loader:
+            images = batch[0].to(device, non_blocking=True)
+            if isinstance(model, ImplicitImageToVoxelNet):
+                points = batch[1].to(device, non_blocking=True)
+                targets = batch[2].to(device, non_blocking=True)
+            else:
+                points = None
+                targets = batch[1].to(device, non_blocking=True)
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                logits = model(images)
-                loss, metrics = voxel_reconstruction_loss(logits, voxels)
+                logits = (
+                    model(images, points)
+                    if isinstance(model, ImplicitImageToVoxelNet)
+                    else model(images)
+                )
+                loss, metrics = voxel_reconstruction_loss(logits, targets)
             predicted = torch.sigmoid(logits) >= 0.5
-            target = voxels >= 0.5
-            intersection = (predicted & target).sum(dim=(1, 2, 3, 4)).float()
-            union = (predicted | target).sum(dim=(1, 2, 3, 4)).float()
+            target = targets >= 0.5
+            reduce_dims = tuple(range(1, target.ndim))
+            intersection = (predicted & target).sum(dim=reduce_dims).float()
+            union = (predicted | target).sum(dim=reduce_dims).float()
             iou = ((intersection + 1.0) / (union + 1.0)).mean()
             for key in ("loss", "bce", "dice"):
                 totals[key] += metrics[key]
@@ -326,7 +343,19 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
 
-    dataset = ImageVoxelDataset(args.data)
+    with np.load(args.data) as archive:
+        representation = str(
+            archive["representation"]
+            if "representation" in archive.files
+            else "dense_voxels"
+        )
+    dataset: TrainingDataset
+    if representation == "implicit_points":
+        dataset = ImplicitImagePointDataset(args.data)
+    elif representation == "dense_voxels":
+        dataset = ImageVoxelDataset(args.data)
+    else:
+        raise ValueError(f"unknown training data representation: {representation}")
     if len(dataset) < 2:
         raise ValueError("at least two image/3D pairs are required")
     training_set, validation_set = split_by_mesh(dataset, args.validation_split, args.seed)
@@ -343,14 +372,21 @@ def main() -> None:
         if validation_count
         else None
     )
-    image_size = dataset.images.shape[-1]
-    resolution = dataset.voxels.shape[-1]
+    image_size = dataset.image_size
+    resolution = dataset.resolution
     model = create_image_to_voxel_model(
         image_size=image_size,
         resolution=resolution,
         latent_dim=args.latent_dim,
-        gradient_checkpointing=resolution >= 256,
+        gradient_checkpointing=resolution == 256,
     ).to(device)
+    if (representation == "implicit_points") != isinstance(
+        model,
+        ImplicitImageToVoxelNet,
+    ):
+        raise ValueError(
+            "training data representation does not match the selected model architecture"
+        )
     if args.resume and args.init_checkpoint:
         raise ValueError("--resume and --init-checkpoint cannot be used together")
     initial_checkpoint_name = (
@@ -428,10 +464,13 @@ def main() -> None:
     print(
         f"Device: {device}; train: {training_count}; validation: {validation_count}; "
         f"image: {image_size}^2; voxels: {resolution}^3; "
-        f"architecture: {model.architecture}; max hours: {args.max_hours:g}"
+        f"architecture: {model.architecture}; representation: {representation}; "
+        f"max hours: {args.max_hours:g}"
     )
     reached_time_limit = False
     for epoch in range(start_epoch, args.epochs + 1):
+        if isinstance(dataset, ImplicitImagePointDataset):
+            dataset.set_epoch(args.seed, epoch)
         training_loader = training_loader_for_epoch(
             training_set,
             loader_options,
@@ -445,15 +484,24 @@ def main() -> None:
             if epoch == start_epoch
             else {key: 0.0 for key in ("loss", "bce", "dice")}
         )
-        for batch_index, (images, voxels) in enumerate(training_loader, start=1):
+        for batch_index, batch in enumerate(training_loader, start=1):
             if batch_index <= completed_batches:
                 continue
-            images = images.to(device, non_blocking=True)
-            voxels = voxels.to(device, non_blocking=True)
+            images = batch[0].to(device, non_blocking=True)
+            if isinstance(model, ImplicitImageToVoxelNet):
+                points = batch[1].to(device, non_blocking=True)
+                targets = batch[2].to(device, non_blocking=True)
+            else:
+                points = None
+                targets = batch[1].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                logits = model(images)
-                loss, metrics = voxel_reconstruction_loss(logits, voxels)
+                logits = (
+                    model(images, points)
+                    if isinstance(model, ImplicitImageToVoxelNet)
+                    else model(images)
+                )
+                loss, metrics = voxel_reconstruction_loss(logits, targets)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -503,6 +551,8 @@ def main() -> None:
 
         train_summary = average_metrics(totals, len(training_loader))
         if validation_loader is not None:
+            if isinstance(dataset, ImplicitImagePointDataset):
+                dataset.set_epoch(args.seed, 0)
             validation_loss, validation_summary, validation_metrics = evaluate(
                 model,
                 validation_loader,

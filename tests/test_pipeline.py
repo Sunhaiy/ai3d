@@ -8,14 +8,23 @@ import numpy as np
 import pytest
 import torch
 import trimesh
+from PIL import Image
 
 from tiny3d.data import generate_dataset, save_dataset, VoxelDataset
-from tiny3d.image_data import ImageVoxelDataset, render_voxel_projection, save_image_voxel_dataset
+from tiny3d.image_data import (
+    ImageVoxelDataset,
+    ImplicitImagePointDataset,
+    render_voxel_projection,
+    save_image_point_dataset,
+    save_image_voxel_dataset,
+)
 from tiny3d.image_model import (
     ImageToVoxelNet,
+    ImplicitImageToVoxelNet,
     ScalableImageToVoxelNet,
     create_image_to_voxel_model,
 )
+from tiny3d.implicit import adaptive_implicit_to_obj
 from tiny3d.mesh import binarize_voxels, field_to_obj, voxels_to_obj
 from tiny3d.mesh_data import find_meshes, load_mesh, mesh_to_voxels
 from tiny3d.model import VoxelVAE, vae_loss, voxel_reconstruction_loss
@@ -148,6 +157,156 @@ def test_model_factory_keeps_256_parameter_count_bounded():
     assert sum(parameter.numel() for parameter in scalable.parameters()) < 10_000_000
 
 
+def test_implicit_dataset_and_model_train_without_dense_high_resolution(tmp_path):
+    rng = np.random.default_rng(9)
+    images = np.zeros((2, 32, 32, 3), dtype=np.uint8)
+    points = rng.uniform(-1.0, 1.0, size=(2, 8192, 3)).astype(np.float16)
+    occupancies = (np.linalg.norm(points, axis=-1) < 0.6).astype(np.uint8)
+    data_path = tmp_path / "implicit_pairs.npz"
+    save_image_point_dataset(
+        data_path,
+        images,
+        points,
+        occupancies,
+        sources=["front|one", "front|two"],
+        point_indices=np.asarray([0, 1], dtype=np.int32),
+        resolution=1024,
+    )
+    dataset = ImplicitImagePointDataset(data_path)
+    image, query_points, targets = dataset[0]
+    model = create_image_to_voxel_model(
+        image_size=32,
+        resolution=1024,
+        latent_dim=16,
+    )
+    logits = model(image.unsqueeze(0), query_points.unsqueeze(0))
+    loss, _ = voxel_reconstruction_loss(logits, targets.unsqueeze(0))
+    loss.backward()
+    assert isinstance(model, ImplicitImageToVoxelNet)
+    assert logits.shape == (1, 8192)
+    assert model.image_encoder[0].weight.grad is not None
+
+
+def test_adaptive_implicit_surface_extraction(tmp_path):
+    class SphereField:
+        resolution = 32
+
+        def eval(self):
+            return self
+
+        def encode_images(self, images):
+            return torch.zeros((len(images), 1), device=images.device)
+
+        def query_encoded(self, image_features, points):
+            return (0.6 - torch.linalg.vector_norm(points, dim=-1)) * 40.0
+
+    output = tmp_path / "sphere.obj"
+    vertices, triangles, coarse, refined = adaptive_implicit_to_obj(
+        SphereField(),
+        torch.zeros((1, 3, 32, 32)),
+        output,
+        threshold=0.5,
+        coarse_resolution=16,
+    )
+    assert coarse.shape == (16, 16, 16)
+    assert vertices > 100
+    assert triangles > 100
+    assert refined is True
+    assert output.is_file()
+
+
+def test_implicit_training_command_saves_high_resolution_checkpoint(tmp_path):
+    rng = np.random.default_rng(12)
+    images = np.zeros((2, 32, 32, 3), dtype=np.uint8)
+    points = rng.uniform(-1.0, 1.0, size=(2, 8192, 3)).astype(np.float16)
+    occupancies = (np.linalg.norm(points, axis=-1) < 0.65).astype(np.uint8)
+    data_path = tmp_path / "implicit_train.npz"
+    output_path = tmp_path / "implicit.pt"
+    save_image_point_dataset(
+        data_path,
+        images,
+        points,
+        occupancies,
+        sources=["front|one", "front|two"],
+        point_indices=np.asarray([0, 1], dtype=np.int32),
+        resolution=512,
+    )
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(project_root / "train_image_to_3d.py"),
+            "--data",
+            str(data_path),
+            "--output",
+            str(output_path),
+            "--epochs",
+            "1",
+            "--batch-size",
+            "1",
+            "--latent-dim",
+            "8",
+            "--validation-split",
+            "0",
+            "--device",
+            "cpu",
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    checkpoint = torch.load(output_path, map_location="cpu", weights_only=True)
+    assert checkpoint["architecture"] == "implicit"
+    assert checkpoint["resolution"] == 512
+
+
+def test_high_resolution_preparation_writes_implicit_points(tmp_path):
+    meshes = tmp_path / "meshes"
+    images = tmp_path / "images"
+    meshes.mkdir()
+    images.mkdir()
+    trimesh.creation.box().export(meshes / "box.obj")
+    Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(images / "box.png")
+    output = tmp_path / "pairs.npz"
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(project_root / "prepare_image3d.py"),
+            "--meshes",
+            str(meshes),
+            "--images",
+            str(images),
+            "--resolution",
+            "512",
+            "--image-size",
+            "32",
+            "--point-count",
+            "4096",
+            "--preview-count",
+            "1",
+            "--output",
+            str(output),
+            "--preview-dir",
+            str(tmp_path / "previews"),
+            "--fail-fast",
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    with np.load(output) as archive:
+        assert str(archive["representation"]) == "implicit_points"
+        assert archive["points"].shape == (1, 4096, 3)
+        assert "voxels" not in archive.files
+
+
 def test_legacy_checkpoint_metadata_defaults_to_legacy_architecture():
     checkpoint = {"image_size": 64, "resolution": 16, "latent_dim": 16}
     model = create_image_to_voxel_model(
@@ -259,6 +418,31 @@ def test_training_data_inspection_and_progress_parsing(tmp_path):
     assert epoch is not None
     assert epoch["validation_loss"] == 0.45
     assert epoch["iou"] == 0.32
+
+
+def test_training_manager_prepares_implicit_resolution(tmp_path, monkeypatch):
+    data_root = tmp_path / "modeldata"
+    meshes = data_root / "meshes"
+    images = data_root / "images"
+    meshes.mkdir(parents=True)
+    images.mkdir()
+    trimesh.creation.box().export(meshes / "box.obj")
+    (images / "box.png").write_bytes(b"placeholder")
+    (images / "box__side.png").write_bytes(b"placeholder")
+    manager = TrainingManager(tmp_path, data_root)
+    captured: dict[str, object] = {}
+
+    def capture_launch(kind, command, **changes):
+        captured.update({"kind": kind, "command": command, "changes": changes})
+
+    monkeypatch.setattr(manager, "_launch", capture_launch)
+    manager.start_preparation(data_root, 1024, 128)
+
+    command = captured["command"]
+    changes = captured["changes"]
+    assert command[command.index("--point-count") + 1] == "65536"
+    assert changes["config"]["architecture"] == "implicit"
+    assert changes["config"]["batch_size"] == 1
 
 
 def test_training_can_pause_and_resume_from_a_batch(tmp_path):
@@ -403,12 +587,21 @@ def test_training_manager_restores_paused_state_after_restart(tmp_path):
     assert status["output_checkpoint"] == "named_run.pt"
 
 
-def test_training_manager_configures_256_long_run(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("resolution", "architecture"),
+    [(256, "scalable"), (512, "implicit"), (1024, "implicit")],
+)
+def test_training_manager_configures_high_resolution_long_run(
+    tmp_path,
+    monkeypatch,
+    resolution,
+    architecture,
+):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     np.savez(
         data_dir / "image3d_pairs.npz",
-        resolution=np.asarray(256),
+        resolution=np.asarray(resolution),
         image_size=np.asarray(128),
         target_count=np.asarray(2),
     )
@@ -424,7 +617,7 @@ def test_training_manager_configures_256_long_run(tmp_path, monkeypatch):
     command = captured["command"]
     changes = captured["changes"]
     assert command[command.index("--max-hours") + 1] == "72.0"
-    assert changes["config"]["architecture"] == "scalable"
+    assert changes["config"]["architecture"] == architecture
     assert changes["config"]["max_hours"] == 72.0
 
 

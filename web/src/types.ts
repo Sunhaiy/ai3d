@@ -62,6 +62,8 @@ export type TrainingDataset = {
   resolution: number;
   image_size: number;
   target_count: number;
+  point_count: number;
+  representation: string;
   preview_path: string;
   inspection_error?: string;
 };

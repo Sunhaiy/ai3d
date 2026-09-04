@@ -66,7 +66,7 @@ def voxel_reconstruction_loss(
     bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=positive_weight)
 
     probabilities = torch.sigmoid(logits)
-    reduce_dims = (1, 2, 3, 4)
+    reduce_dims = tuple(range(1, probabilities.ndim))
     intersection = (probabilities * target).sum(dim=reduce_dims)
     denominator = probabilities.sum(dim=reduce_dims) + target.sum(dim=reduce_dims)
     dice = (1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)).mean()

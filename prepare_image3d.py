@@ -11,10 +11,17 @@ from tiny3d.image_data import (
     find_images,
     load_square_image,
     render_voxel_projection,
+    save_image_point_dataset,
     save_image_voxel_dataset,
 )
 from tiny3d.mesh import voxels_to_obj
-from tiny3d.mesh_data import find_meshes, load_mesh, mesh_to_voxels
+from tiny3d.mesh_data import (
+    find_meshes,
+    load_mesh,
+    mesh_to_voxels,
+    normalize_mesh,
+    sample_implicit_occupancy,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-fill", action="store_true")
     parser.add_argument("--preview-dir", default="data/image3d_previews")
     parser.add_argument("--preview-count", type=int, default=8)
+    parser.add_argument("--point-count", type=int, default=65536)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fail-fast", action="store_true")
     return parser.parse_args()
 
@@ -59,6 +68,8 @@ def main() -> None:
         raise ValueError("views must be at least 1")
     if args.preview_count < 0:
         raise ValueError("preview-count cannot be negative")
+    if args.resolution >= 512 and args.point_count < 4096:
+        raise ValueError("point-count must be at least 4096 for implicit datasets")
     if args.images and args.views != 1:
         raise ValueError("--views is only used for automatically rendered images")
 
@@ -68,9 +79,13 @@ def main() -> None:
     image_index = find_images(args.images) if args.images else None
     all_images: list[np.ndarray] = []
     all_voxels: list[np.ndarray] = []
+    all_points: list[np.ndarray] = []
+    all_occupancies: list[np.ndarray] = []
     voxel_indices: list[int] = []
     sources: list[str] = []
+    preview_targets = []
     failed = 0
+    implicit = args.resolution >= 512
 
     for mesh_index, mesh_path in enumerate(mesh_paths, start=1):
         try:
@@ -79,25 +94,66 @@ def main() -> None:
                 matching_images = image_index.get(mesh_path.stem.casefold(), [])
                 if not matching_images:
                     raise ValueError("no image with the same base name was found")
-                voxels = mesh_to_voxels(mesh, args.resolution, fill=not args.no_fill)
-                voxel_index = len(all_voxels)
-                all_voxels.append(voxels)
-                for image_path in matching_images:
-                    all_images.append(load_square_image(image_path, args.image_size))
-                    voxel_indices.append(voxel_index)
-                    sources.append(f"{image_path}|{mesh_path}")
-            else:
-                for view_index in range(args.views):
-                    angle = 2.0 * np.pi * view_index / args.views
+                if implicit:
+                    points, occupancies = sample_implicit_occupancy(
+                        mesh,
+                        args.resolution,
+                        args.point_count,
+                        seed=args.seed + mesh_index,
+                    )
+                    voxel_index = len(all_points)
+                    all_points.append(points)
+                    all_occupancies.append(occupancies)
+                else:
                     voxels = mesh_to_voxels(
                         mesh,
                         args.resolution,
                         fill=not args.no_fill,
-                        transform=yaw_matrix(angle),
                     )
-                    all_images.append(render_voxel_projection(voxels, args.image_size))
+                    voxel_index = len(all_voxels)
                     all_voxels.append(voxels)
-                    voxel_indices.append(len(all_voxels) - 1)
+                for image_path in matching_images:
+                    all_images.append(load_square_image(image_path, args.image_size))
+                    voxel_indices.append(voxel_index)
+                    sources.append(f"{image_path}|{mesh_path}")
+                    if implicit and len(preview_targets) < args.preview_count:
+                        preview_targets.append(normalize_mesh(mesh))
+            else:
+                for view_index in range(args.views):
+                    angle = 2.0 * np.pi * view_index / args.views
+                    transform = yaw_matrix(angle)
+                    if implicit:
+                        points, occupancies = sample_implicit_occupancy(
+                            mesh,
+                            args.resolution,
+                            args.point_count,
+                            seed=args.seed + mesh_index * args.views + view_index,
+                            transform=transform,
+                        )
+                        all_points.append(points)
+                        all_occupancies.append(occupancies)
+                        voxel_indices.append(len(all_points) - 1)
+                        projection_voxels = mesh_to_voxels(
+                            mesh,
+                            128,
+                            fill=not args.no_fill,
+                            transform=transform,
+                        )
+                        all_images.append(
+                            render_voxel_projection(projection_voxels, args.image_size)
+                        )
+                        if len(preview_targets) < args.preview_count:
+                            preview_targets.append(normalize_mesh(mesh, transform))
+                    else:
+                        voxels = mesh_to_voxels(
+                            mesh,
+                            args.resolution,
+                            fill=not args.no_fill,
+                            transform=transform,
+                        )
+                        all_images.append(render_voxel_projection(voxels, args.image_size))
+                        all_voxels.append(voxels)
+                        voxel_indices.append(len(all_voxels) - 1)
                     sources.append(f"auto-view-{view_index}|{mesh_path}")
             print(f"[{mesh_index}/{len(mesh_paths)}] OK   {mesh_path}")
         except Exception as error:
@@ -110,15 +166,28 @@ def main() -> None:
         raise RuntimeError("no valid image and mesh pairs were created")
 
     image_array = np.stack(all_images)
-    voxel_array = np.stack(all_voxels)
     voxel_index_array = np.asarray(voxel_indices, dtype=np.int32)
-    save_image_voxel_dataset(
-        args.output,
-        image_array,
-        voxel_array,
-        sources=sources,
-        voxel_indices=voxel_index_array,
-    )
+    if implicit:
+        point_array = np.stack(all_points)
+        occupancy_array = np.stack(all_occupancies)
+        save_image_point_dataset(
+            args.output,
+            image_array,
+            point_array,
+            occupancy_array,
+            sources=sources,
+            point_indices=voxel_index_array,
+            resolution=args.resolution,
+        )
+    else:
+        voxel_array = np.stack(all_voxels)
+        save_image_voxel_dataset(
+            args.output,
+            image_array,
+            voxel_array,
+            sources=sources,
+            voxel_indices=voxel_index_array,
+        )
 
     preview_dir = Path(args.preview_dir)
     preview_dir.mkdir(parents=True, exist_ok=True)
@@ -126,16 +195,27 @@ def main() -> None:
         Image.fromarray(image_array[index], mode="RGB").save(
             preview_dir / f"preview_{index:04d}_input.png"
         )
-        voxels_to_obj(
-            voxel_array[voxel_index_array[index]],
-            preview_dir / f"preview_{index:04d}_target.obj",
-        )
+        if implicit:
+            preview_targets[index].export(
+                preview_dir / f"preview_{index:04d}_target.obj"
+            )
+        else:
+            voxels_to_obj(
+                voxel_array[voxel_index_array[index]],
+                preview_dir / f"preview_{index:04d}_target.obj",
+            )
 
     print(f"Saved {len(image_array)} image/3D pairs to {args.output}")
-    print(
-        f"Images: {image_array.shape}; unique voxel targets: {voxel_array.shape}; "
-        f"indices: {voxel_index_array.shape}"
-    )
+    if implicit:
+        print(
+            f"Images: {image_array.shape}; implicit point targets: {point_array.shape}; "
+            f"indices: {voxel_index_array.shape}"
+        )
+    else:
+        print(
+            f"Images: {image_array.shape}; unique voxel targets: {voxel_array.shape}; "
+            f"indices: {voxel_index_array.shape}"
+        )
     print(f"Preview pairs: {min(args.preview_count, len(image_array))} in {preview_dir}")
     if failed:
         print(f"Skipped {failed} meshes; review the SKIP lines above.")

@@ -16,7 +16,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tiny3d.image_data import load_square_image
-from tiny3d.image_model import ImageToVoxelModel, create_image_to_voxel_model
+from tiny3d.image_model import (
+    ImageToVoxelModel,
+    ImplicitImageToVoxelNet,
+    create_image_to_voxel_model,
+)
+from tiny3d.implicit import adaptive_implicit_to_obj
 from tiny3d.mesh import binarize_voxels, field_to_obj
 from training_manager import TrainingManager
 
@@ -146,26 +151,52 @@ def run_generation(job_id: str, checkpoint_path: Path, image_path: Path, thresho
             tensor = tensor.permute(2, 0, 1).unsqueeze(0).to(device)
             add_log(job_id, f"图片已归一化为 {model.image_size} x {model.image_size}")
 
-            update_job(job_id, stage="inference", progress=66)
-            add_log(job_id, f"在 {device.type.upper()} 上执行体素推理")
-            with torch.inference_mode():
-                probabilities = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
-
-            update_job(job_id, stage="mesh", progress=84)
-            voxels = binarize_voxels(probabilities, threshold)
             job_dir = JOBS_DIR / job_id
             obj_path = job_dir / "result.obj"
             npy_path = job_dir / "result.npy"
-            np.save(npy_path, voxels.astype(np.uint8))
-            vertices, triangles = field_to_obj(
-                probabilities,
-                obj_path,
-                threshold=threshold,
-            )
-            add_log(
-                job_id,
-                f"网格完成：{int(voxels.sum())} 体素，{vertices} 顶点，{triangles} 三角面",
-            )
+            update_job(job_id, stage="inference", progress=66)
+            if isinstance(model, ImplicitImageToVoxelNet):
+                add_log(
+                    job_id,
+                    f"在 {device.type.upper()} 上执行 {model.resolution}³ 隐式表面采样",
+                )
+                vertices, triangles, probabilities, refined = adaptive_implicit_to_obj(
+                    model,
+                    tensor,
+                    obj_path,
+                    threshold=threshold,
+                    progress=lambda value: update_job(
+                        job_id,
+                        stage="mesh",
+                        progress=66 + round(value * 28),
+                    ),
+                )
+                voxels = binarize_voxels(probabilities, threshold)
+                np.save(npy_path, voxels.astype(np.uint8))
+                add_log(
+                    job_id,
+                    (
+                        f"自适应网格完成：{vertices} 顶点，{triangles} 三角面"
+                        if refined
+                        else f"表面过于分散，使用 128³ 保底网格：{triangles} 三角面"
+                    ),
+                )
+            else:
+                add_log(job_id, f"在 {device.type.upper()} 上执行体素推理")
+                with torch.inference_mode():
+                    probabilities = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
+                update_job(job_id, stage="mesh", progress=84)
+                voxels = binarize_voxels(probabilities, threshold)
+                np.save(npy_path, voxels.astype(np.uint8))
+                vertices, triangles = field_to_obj(
+                    probabilities,
+                    obj_path,
+                    threshold=threshold,
+                )
+                add_log(
+                    job_id,
+                    f"网格完成：{int(voxels.sum())} 体素，{vertices} 顶点，{triangles} 三角面",
+                )
 
         elapsed = time.perf_counter() - started
         update_job(
